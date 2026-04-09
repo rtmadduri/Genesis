@@ -542,6 +542,35 @@ def func_compute_mass_matrix(
 
 
 @qd.func
+def _linear_to_lower_tri(i_pair: qd.i32):
+    """Linear index -> (row, col) of a lower-triangular matrix including diagonal.
+
+    Sequence: (0,0), (1,0), (1,1), (2,0), (2,1), (2,2), ...
+    Uses f32 sqrt (fast on all backends) with integer post-correction for
+    GPUs whose sqrt is not correctly rounded on perfect squares.
+    """
+    i_d = qd.cast(qd.floor((qd.sqrt(qd.cast(8 * i_pair + 1, qd.f32)) - 1.0) / 2.0), qd.i32)
+    if (i_d + 1) * (i_d + 2) // 2 <= i_pair:
+        i_d = i_d + 1
+    j_d = i_pair - i_d * (i_d + 1) // 2
+    return i_d, j_d
+
+
+@qd.func
+def _linear_to_strict_lower_tri(i_pair: qd.i32):
+    """Linear index -> (row, col) of a strict lower-triangular matrix (no diagonal).
+
+    Sequence: (1,0), (2,0), (2,1), (3,0), (3,1), (3,2), ...
+    Uses f32 sqrt with integer post-correction.
+    """
+    i_d = qd.cast(qd.floor((qd.sqrt(qd.cast(8 * i_pair + 1, qd.f32)) + 1.0) / 2.0), qd.i32)
+    if i_d * (i_d + 1) // 2 <= i_pair:
+        i_d = i_d + 1
+    j_d = i_pair - i_d * (i_d - 1) // 2
+    return i_d, j_d
+
+
+@qd.func
 def func_factor_mass(
     implicit_damping: qd.template(),
     entities_info: array_class.EntitiesInfo,
@@ -558,7 +587,9 @@ def func_factor_mass(
         _B = dofs_state.ctrl_mode.shape[1]
 
         if qd.static(
-            not static_rigid_sim_config.enable_tiled_cholesky_mass_matrix or static_rigid_sim_config.backend == gs.cpu
+            not static_rigid_sim_config.enable_tiled_cholesky_mass_matrix
+            or static_rigid_sim_config.backend == gs.cpu
+            # or static_rigid_sim_config.backend == gs.amdgpu
         ):
             qd.loop_config(name="factor_mass", serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.PARTIAL)
             for i_e, i_b in qd.ndrange(n_entities, _B):
@@ -601,9 +632,10 @@ def func_factor_mass(
                         # FIXME: Diagonal coeffs of L are ignored in computations, so no need to update them.
                         rigid_global_info.mass_mat_L[i_d, i_d, i_b] = 1.0
         else:
-            BLOCK_DIM = qd.static(32)
+            # BLOCK_DIM = qd.static(64 if static_rigid_sim_config.backend == gs.amdgpu else 32)
+            BLOCK_DIM = qd.static(128)
             MAX_DOFS_PER_ENTITY = qd.static(static_rigid_sim_config.tiled_n_dofs_per_entity)
-            WARP_SIZE = qd.static(32)
+            WARP_SIZE = qd.static(64)
 
             qd.loop_config(name="factor_mass", block_dim=BLOCK_DIM)
             for i in range(n_entities * _B * BLOCK_DIM):
@@ -623,8 +655,7 @@ def func_factor_mass(
 
                     i_pair = tid
                     while i_pair < n_lower_tri:
-                        i_d_ = qd.cast((qd.sqrt(8 * i_pair + 1) - 1) // 2, qd.i32)
-                        j_d_ = i_pair - i_d_ * (i_d_ + 1) // 2
+                        i_d_, j_d_ = _linear_to_lower_tri(i_pair)
                         i_d = entity_dof_start + i_d_
                         j_d = entity_dof_start + j_d_
                         mass_mat[i_d_, j_d_] = rigid_global_info.mass_mat[i_d, j_d, i_b]
@@ -665,7 +696,10 @@ def func_factor_mass(
                                 mass_mat[j_d_, k_d] = mass_mat[j_d_, k_d] - a * mass_mat[i_d_, k_d]
                             mass_mat[i_d_, j_d_] = a
                             j_d_ = j_d_ - BLOCK_DIM
-                        if qd.static(static_rigid_sim_config.backend == gs.cuda):
+                        if qd.static(
+                            static_rigid_sim_config.backend == gs.cuda
+                            or static_rigid_sim_config.backend == gs.amdgpu
+                        ):
                             if i_d_ <= WARP_SIZE:
                                 qd.simt.warp.sync(qd.u32(0xFFFFFFFF))
                             else:
@@ -676,8 +710,7 @@ def func_factor_mass(
                     i_pair = tid
                     n_strict_lower_tri = n_dofs * (n_dofs - 1) // 2
                     while i_pair < n_strict_lower_tri:
-                        i_d_ = qd.cast((qd.sqrt(8 * i_pair + 1) + 1) // 2, qd.i32)
-                        j_d_ = i_pair - i_d_ * (i_d_ - 1) // 2
+                        i_d_, j_d_ = _linear_to_strict_lower_tri(i_pair)
                         i_d = entity_dof_start + i_d_
                         j_d = entity_dof_start + j_d_
                         rigid_global_info.mass_mat_L[i_d, j_d, i_b] = mass_mat[i_d_, j_d_]
