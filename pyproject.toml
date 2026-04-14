@@ -11,6 +11,7 @@ requires-python = ">=3.10,<3.14"
 dependencies = [
     "psutil",
     "pydantic>=2.11.0",
+    "quadrants==0.5.2",
     "numpy>=1.26.4",
     "frozendict",
     "trimesh",

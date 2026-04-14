@@ -503,9 +503,16 @@ def func_compute_mass_matrix(
                         ) * rigid_global_info.mass_parent_mask[i_d, j_d]
 
                 if qd.static(not BW):
-                    for i_d in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
-                        for j_d in range(i_d + 1, entities_info.dof_end[i_e]):
-                            rigid_global_info.mass_mat[i_d, j_d, i_b] = rigid_global_info.mass_mat[j_d, i_d, i_b]
+                    _e_start_m = entities_info.dof_start[i_e]
+                    _e_nd = entities_info.n_dofs[i_e]
+                    _n_upper = _e_nd * (_e_nd - 1) // 2
+                    for _pair_idx in range(_n_upper):
+                        _row = qd.cast((qd.sqrt(8.0 * qd.cast(_pair_idx, gs.qd_float) + 1.0) + 1.0) // 2.0, qd.i32)
+                        _col = _pair_idx - _row * (_row - 1) // 2
+                        rigid_global_info.mass_mat[_e_start_m + _col, _e_start_m + _row, i_b] = rigid_global_info.mass_mat[_e_start_m + _row, _e_start_m + _col, i_b]
+                    # for i_d in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
+                    #     for j_d in range(i_d + 1, entities_info.dof_end[i_e]):
+                    #         rigid_global_info.mass_mat[i_d, j_d, i_b] = rigid_global_info.mass_mat[j_d, i_d, i_b]
                 else:
                     for i_d_, j_d_ in qd.static(
                         qd.ndrange(
@@ -633,7 +640,7 @@ def func_factor_mass(
                         rigid_global_info.mass_mat_L[i_d, i_d, i_b] = 1.0
         else:
             # BLOCK_DIM = qd.static(64 if static_rigid_sim_config.backend == gs.amdgpu else 32)
-            BLOCK_DIM = qd.static(128)
+            BLOCK_DIM = qd.static(64)
             MAX_DOFS_PER_ENTITY = qd.static(static_rigid_sim_config.tiled_n_dofs_per_entity)
             WARP_SIZE = qd.static(64)
 
@@ -702,7 +709,7 @@ def func_factor_mass(
                         ):
                             if i_d_ <= WARP_SIZE:
                                 qd.simt.warp.sync(qd.u32(0xFFFFFFFF))
-                            else:
+                            elif qd.static(BLOCK_DIM > 64):
                                 qd.simt.block.sync()
                         else:
                             qd.simt.block.sync()
