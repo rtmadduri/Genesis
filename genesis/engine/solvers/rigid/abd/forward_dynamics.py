@@ -686,6 +686,8 @@ def func_factor_mass(
                             i_d_ = i_d_ + BLOCK_DIM
                         qd.simt.block.sync()
 
+                    sh_pivot = qd.simt.block.SharedArray((BLOCK_DIM,), gs.qd_float)
+
                     for j in range(n_dofs):
                         i_d_ = n_dofs - j - 1
                         i_d = entity_dof_end - j - 1
@@ -693,16 +695,28 @@ def func_factor_mass(
                         D_inv = 1.0 / mass_mat[i_d_, i_d_]
                         if tid == 0:
                             rigid_global_info.mass_mat_D_inv[i_d, i_b] = D_inv
-                            # FIXME: Diagonal coeffs of L are ignored in computations, so no need to update them.
                             rigid_global_info.mass_mat_L[i_d, i_d, i_b] = 1.0
 
-                        j_d_ = i_d_ - 1 - tid
-                        while j_d_ >= 0:
-                            a = mass_mat[i_d_, j_d_] * D_inv
-                            for k_d in range(j_d_ + 1):
-                                mass_mat[j_d_, k_d] = mass_mat[j_d_, k_d] - a * mass_mat[i_d_, k_d]
-                            mass_mat[i_d_, j_d_] = a
-                            j_d_ = j_d_ - BLOCK_DIM
+                        # Cache original pivot row values before modification
+                        if tid < i_d_:
+                            sh_pivot[tid] = mass_mat[i_d_, tid]
+                        # wave64: all threads in lockstep, no explicit sync needed
+
+                        # Balanced rank-1 update: flatten (row, col) pairs across all threads
+                        _n_updates = i_d_ * (i_d_ + 1) // 2
+                        _upd = tid
+                        while _upd < _n_updates:
+                            _r = qd.cast((qd.sqrt(8.0 * qd.cast(_upd, gs.qd_float) + 1.0) - 1.0) * 0.5, qd.i32)
+                            if _r * (_r + 1) // 2 > _upd:
+                                _r = _r - 1
+                            _c = _upd - _r * (_r + 1) // 2
+                            mass_mat[_r, _c] = mass_mat[_r, _c] - sh_pivot[_r] * D_inv * sh_pivot[_c]
+                            _upd = _upd + BLOCK_DIM
+
+                        # Write L factors to pivot row
+                        if tid < i_d_:
+                            mass_mat[i_d_, tid] = sh_pivot[tid] * D_inv
+
                         if qd.static(
                             static_rigid_sim_config.backend == gs.cuda
                             or static_rigid_sim_config.backend == gs.amdgpu
